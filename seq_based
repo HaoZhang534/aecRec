@@ -1,0 +1,411 @@
+import tensorflow as tf
+import numpy as np
+import random as rnd
+import os
+import time
+import math
+import sys
+from tensorflow.data import Dataset as dt
+from tensorflow.contrib.rnn import GRUCell, MultiRNNCell
+
+# from scipy.sparse import coo_matrix,csr_matrix
+from multiprocessing import Pool
+
+FLAGS = tf.flags.FLAGS
+tf.flags.DEFINE_integer("user_num", 69878, "user num")
+tf.flags.DEFINE_integer("item_num", 10677, "item num")
+tf.flags.DEFINE_integer("genre_num", 19, "item num")
+# tf.flags.DEFINE_integer("lst_seq", 7359, "the length of the longest sequence")
+
+tf.flags.DEFINE_string("data_file", "./data_set", "training and testing data file")
+
+tf.flags.DEFINE_string("model_path", "./model", "test file")
+tf.flags.DEFINE_string("genre_file", "./movie_tag.npy", "test file")
+
+
+def item_embedding(emb_dim, reg):
+    genre = np.load(FLAGS.genre_file).astype(np.float32)
+    item_emb = dense(genre, in_dim=FLAGS.genre_num, out_dim=emb_dim, activation=tf.sigmoid, bias=True, kernel_reg=reg,
+                     name='item_embedding')
+    item_emb = tf.pad(item_emb, [[0, 1], [0, 0]])
+    return item_emb
+
+
+def load_from_disk(filename):
+    dataset = dt.from_tensor_slices(filename)
+    dataset = dataset.flat_map(
+        lambda filename: (
+            tf.data.TextLineDataset(filename)))
+    return dataset
+
+
+def load_and_align(filenames, batch_align=1000):
+    # count the number of lines
+    num_samples = 0
+    for filename in filenames:
+        num_samples += sum(1 for line in open(filename, 'r'))
+    steps_aligned = np.ceil(num_samples / batch_align)
+    num_trival = steps_aligned * batch_align - num_samples
+
+    # create a trivial file for alignment
+    if num_trival != 0:
+        file_align = 'data_align'
+        filenames.append(file_align)
+
+        data_trival = [':\n' for _ in range(int(num_trival))]
+        with open(str(file_align), 'w') as fo:
+            fo.writelines(data_trival)
+
+    dataset = tf.data.Dataset.from_tensor_slices(filenames)
+    dataset = dataset.flat_map(
+        lambda filename: (
+            tf.data.TextLineDataset(filename)))
+    return dataset
+
+
+def parse_py_fn(line):
+    '''
+    pairs[0]:sequence
+    pairs[1]:train
+    pairs[2]:test
+    :param line:
+    :param mode:
+    :return: ratings[item_num],seq_rat[seq_len],seq[seq_len],seq_tr_mask[seq_len]
+    '''
+    item_num = FLAGS.item_num
+    # ratings = np.zeros(item_num)
+    seq_rat = []
+    seq = []
+    seq_tr_mask = []
+    line = str(line, encoding='utf8').strip()
+    if line == ':':
+        seq_rat = [0]
+        seq = [FLAGS.item_num]
+        seq_tr_mask = [0]
+        # return ratings.astype(np.float32), np.array(seq_rat).astype(np.float32), np.array(seq).astype(
+        #     np.int32), np.array(seq_tr_mask).astype(np.int32)
+        return np.array(seq_rat).astype(np.float32), np.array(seq).astype(np.int32), np.array(
+            seq_tr_mask).astype(np.int32)
+
+    pairs = line.split()
+    assert len(pairs) == 3
+    seq_ = str(pairs[0]).split(',')
+    for i in range(len(seq_)):
+        tmp = str(seq_[i]).split(':')
+        iid = int(tmp[0])
+        rat = float(tmp[1])
+        tr = int(tmp[2])
+        seq.append(iid)
+        seq_rat.append(rat)
+        seq_tr_mask.append(tr)
+
+    # tr = str(pairs[1]).split(',')
+    # for i in tr:
+    #     ii = str(i).split(':')
+    #     ratings[int(ii[0])] = float(ii[1])
+
+    # return ratings.astype(np.float32), np.array(seq_rat).astype(np.float32), np.array(seq).astype(np.int32), np.array(
+    #     seq_tr_mask).astype(np.int32)
+    return np.array(seq_rat).astype(np.float32), np.array(seq).astype(np.int32), np.array(
+        seq_tr_mask).astype(np.int32)
+
+def parse2(seq_rat,seq,seq_tr_mask):
+    ratings = np.zeros(FLAGS.item_num)
+    if seq[0]==10677:
+        return ratings.astype(np.float32), seq_rat, seq, seq_tr_mask
+    for i in range(len(seq_rat)):
+        ratings[seq[i]]=seq_rat[i]*seq_tr_mask[i]
+    return ratings.astype(np.float32), seq_rat, seq, seq_tr_mask
+
+
+
+
+def input_fr_py_pn(dataset, mode, params):
+
+    dataset = dataset.map(
+        lambda line: tuple(tf.py_func(parse_py_fn, [line], [tf.float32, tf.int32, tf.int32])))
+
+    dataset = dataset.cache()
+
+    dataset=dataset.map(lambda x1,x2,x3:tuple(tf.py_func(parse2,[x1,x2,x3],[tf.float32,tf.float32, tf.int32, tf.int32])))
+
+    if mode.startswith('train'):
+        dataset = dataset.shuffle(FLAGS.user_num)
+    dataset = dataset.padded_batch(params['bat_sz'], padded_shapes=([None], [None], [None], [None]),
+                                   padding_values=(0.0, 0.0, FLAGS.item_num, 0))
+
+    dataset = dataset.repeat()
+    iterator = dataset.make_one_shot_iterator()
+
+    ratings, seq_rat, seq, seq_tr_mask = iterator.get_next()
+    return seq, ratings, seq_rat, seq_tr_mask
+
+
+def user_embedding(tr_rat, emb_dim, reg):
+    user_emb = dense(tr_rat, FLAGS.item_num, emb_dim, activation=tf.sigmoid, bias=True, kernel_reg=reg,
+                     name='user_embedding')
+    return user_emb
+
+
+def attention(x):
+    return x
+
+
+def seq_embedding(seq_item_emb, emb_dim, layer_num):
+    if layer_num == 1:
+        cell = GRUCell(num_units=emb_dim, activation=tf.sigmoid, reuse=tf.AUTO_REUSE, name='rnn_layer1')
+        outputs, state = tf.nn.dynamic_rnn(cell, seq_item_emb, dtype=tf.float32)
+        outputs = attention(outputs)
+        return outputs
+    else:
+        cells = [GRUCell(num_units=emb_dim[i], activation=tf.sigmoid, reuse=tf.AUTO_REUSE, name='rnn_layer1') for i in
+                 range(layer_num)]
+        cell = MultiRNNCell(cells=cells)
+        outputs, state = tf.nn.dynamic_rnn(cell, seq_item_emb, dtype=tf.float32)
+        outputs = attention(outputs)
+        return outputs
+
+
+def dense(tr_mat, in_dim, out_dim, activation, bias, kernel_reg, name):
+    with tf.variable_scope(name, reuse=tf.AUTO_REUSE):
+        w = tf.get_variable("w", shape=[in_dim, out_dim], regularizer=kernel_reg)
+        if bias:
+            b = tf.get_variable("b", shape=[out_dim], initializer=tf.zeros_initializer)
+            pre = tf.nn.bias_add(tf.matmul(tr_mat, w), b)
+        else:
+            pre = tf.matmul(tr_mat, w)
+
+        h = activation(pre)
+
+        return h
+
+
+def construct_hp_str(params):
+    genre_emb_dim = params['layer_num']
+    feature_dim = params['emb_dim']
+    lamb = params['lamb']
+    lr = params['lr']
+
+    return 'ly%d_emb%d_lb%f_lr_%f' % (layer_num, feature_dim, lamb, lr)
+
+
+def model1(mode, ratings, seq, seq_rat, seq_tr_mask, params):
+    '''
+        :param mode:
+        :param ratings:
+        :param seq_item_emb:
+        :param seq_rat:
+        :param seq_tr_mask:
+        :param params: lamb,bat_sz,exp_decay,lr,decay_steps,decay_rate,emb_dim,mini_bat_sz
+        :return:
+        '''
+    emb_dim = params['emb_dim']
+    lamb = params['lamb']
+    if mode.startswith('train'):
+        bat_sz = params['bat_sz']
+    else:
+        bat_sz = params['tst_bat_sz']
+    mini_bat_sz = params['mini_bat_sz']
+    layer_num = params['layer_num']
+    layer_emb_sz = params['layer_emb_sz']
+    if layer_num > 1:
+        assert layer_emb_sz[-1] == emb_dim
+
+    round = bat_sz // mini_bat_sz
+    with tf.variable_scope('Shared'):
+        reg = tf.contrib.layers.l2_regularizer(scale=lamb)
+        item_emb = item_embedding(emb_dim, reg)
+
+        for i in range(int(round)):
+            ratings_ = tf.slice(ratings, [i * mini_bat_sz, 0], [mini_bat_sz, FLAGS.item_num])
+            seq_ = tf.slice(seq, [i * mini_bat_sz, 0], [mini_bat_sz, -1])
+            user_emb = user_embedding(ratings_, emb_dim, reg)
+            seq_item_emb = tf.gather(item_emb, seq_)
+            if layer_num == 1:
+                seq_emb = seq_embedding(seq_item_emb, emb_dim, layer_num)
+            else:
+                seq_emb = seq_embedding(seq_item_emb, layer_emb_sz, layer_num)
+
+            user_emb = tf.reshape(user_emb, (mini_bat_sz, 1, emb_dim))
+            user_emb = tf.add(user_emb, seq_emb)
+            user_emb = user_emb * seq_item_emb
+            if i == 0:
+                h = tf.reduce_sum(user_emb, 2)
+            else:
+                h = tf.concat([h, tf.reduce_sum(user_emb, 2)], 0)
+    if mode.startswith('test'):
+        h = tf.minimum(tf.maximum(h, 0.5), 5.0)
+
+    exp_decay = params['exp_decay']
+    if mode.startswith("train"):
+        with tf.name_scope("train"):
+            initial_learning_rate = params['lr']
+            global_step = tf.Variable(0, trainable=False)
+            if exp_decay:
+                decay_steps = params['decay_steps']
+                decay_rate = params['decay_rate']
+                learning_rate = tf.train.exponential_decay(initial_learning_rate,
+                                                           global_step=global_step,
+                                                           decay_steps=decay_steps, decay_rate=decay_rate)
+            else:
+                learning_rate = tf.constant(value=initial_learning_rate)
+
+            add_global = global_step.assign_add(1)
+            with tf.variable_scope("AE_TR_METRIC"):
+                tr_metric = {
+                    "RMSE": tf.metrics.root_mean_squared_error(seq_rat, h, weights=seq_tr_mask)}
+                tr_metric_op = tf.tuple([op for _, op in tr_metric.values()])
+            loss = tf.losses.mean_squared_error(seq_rat, h, weights=seq_tr_mask) + tf.losses.get_regularization_loss()
+            tr_opt = tf.train.AdamOptimizer(learning_rate).minimize(loss)
+
+        return tr_metric_op, tr_opt, learning_rate, add_global
+    else:
+        with tf.name_scope("test"):
+
+            with tf.variable_scope('AE_TST_METRIC'):
+                tst_metric = {
+                    "RMSE": tf.metrics.root_mean_squared_error(seq_rat, h,
+                                                               weights=tf.sign(seq_rat) - tf.cast(seq_tr_mask,
+                                                                                                  'float32'))}
+                tst_metric_op = tf.tuple([op for _, op in tst_metric.values()])
+
+        return tst_metric_op
+
+
+def prepare_for_train_or_test(filename, mode, model_params, model):
+    # dt1 = load_from_disk([filename])
+    dt1 = load_and_align([filename], model_params['bat_sz'])
+    seq, ratings, seq_rat, seq_tr_mask = input_fr_py_pn(dt1, mode=mode, params=model_params)
+
+    if mode.startswith('train'):
+        tr_metric_op, tr_opt, learning_rate, add_global = model(mode, ratings=ratings, seq=seq, seq_rat=seq_rat,
+                                                                seq_tr_mask=seq_tr_mask, params=model_params)
+        tr_metric_init_op = tf.variables_initializer(
+            tf.get_collection(tf.GraphKeys.LOCAL_VARIABLES, scope="train/AE_TR_METRIC"))
+        per_ep_op = (add_global, learning_rate, tr_metric_init_op)
+        per_step_op = (tr_opt, tr_metric_op)
+        config = tf.ConfigProto(
+            allow_soft_placement=True)
+        config.gpu_options.allow_growth = True
+        sess = tf.Session(config=config)
+        return sess, per_ep_op, per_step_op
+
+    else:
+        tst_metric_op = model(mode=mode, ratings=ratings, seq=seq, seq_rat=seq_rat, seq_tr_mask=seq_tr_mask,
+                              params=model_params)
+        tst_metric_init_op = tf.variables_initializer(
+            tf.get_collection(tf.GraphKeys.LOCAL_VARIABLES, scope="test/AE_TST_METRIC"))
+        per_ep_op = tst_metric_init_op
+        per_step_op = tst_metric_op
+        return per_ep_op, per_step_op
+
+
+def test(sess, tr_metric_init_op, op, tst_num_steps, RMSE_list):
+    sess.run(tr_metric_init_op)
+    for i in range(1, tst_num_steps + 1):
+        metric, = sess.run(op)
+        print("MSRE:" + str(metric))
+    return metric
+
+
+def run(filename, model_params, train_params, model=model1):
+    repeat_times = train_params['total_ep']
+    test_ep = train_params['test_ep']
+    save_ep = train_params['save_ep']
+    restore_ep = train_params['restore_ep']
+    model_path = train_params['model_path']
+    result_path = train_params['result_path']
+    batch_size = model_params['bat_sz']
+    mode = 'train'
+    sess, per_ep_op, per_step_op = prepare_for_train_or_test(filename=filename, mode=mode, model_params=model_params,
+                                                             model=model)
+
+    f_res = open(result_path + "/result", "a")
+    f_res.write(construct_hp_str(model_params) + '\n')
+    RMSE_list = []
+
+    test_params = prepare_for_train_or_test(filename, 'test', model_params, model=model)
+    num_steps = math.ceil(FLAGS.item_num / batch_size)
+    tst_num_steps = math.ceil(FLAGS.item_num / model_params['tst_bat_sz'])
+    saver = tf.train.Saver()
+    assert model_path != None, "Model path is invalid"
+    if restore_ep == 0:
+        init = tf.global_variables_initializer()
+        sess.run(init)
+    else:
+        saver.restore(sess, "%s/ae%d" % (model_path, restore_ep))
+    # Training
+    for epoch in range(1, repeat_times + 1):
+
+        sess.run(per_ep_op)
+
+        for i in range(1, num_steps + 1):
+            _, metric = sess.run(per_step_op)
+            print("epoch:%d,step:%d   " % (restore_ep + epoch, i))
+            print(str(metric))
+
+        if (epoch + restore_ep) % save_ep == 0 or epoch == repeat_times:
+            save_path = "%s/ae%d" % (model_path, epoch + restore_ep)
+            saver.save(sess, save_path)
+            print("Model Saved!")
+        if (epoch + restore_ep) % test_ep == 0 or epoch == repeat_times:
+            tst_metric_init_op, op = test_params
+            metric = test(sess=sess, tr_metric_init_op=tst_metric_init_op, op=op, tst_num_steps=tst_num_steps,
+                          RMSE_list=RMSE_list)
+            if len(RMSE_list) >= 2 and metric > RMSE_list[len(RMSE_list) - 1]:
+                break
+            RMSE_list.append(metric)
+            f_res.write("%d     %f\n" % (epoch + restore_ep, metric))
+    f_res.close()
+    print("Best performence is %f" % min(RMSE_list))
+    print(result_path)
+    return min(RMSE_list)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) == 1:
+        restore_ep = 0
+    else:
+        restore_ep = int(sys.argv[1])
+
+    lamb = 1e-4
+    lr = 1e-4
+    emb_dim = 512
+    rat = 512
+
+    exp_decay = False
+    decay_rate = 0.33
+    decay_steps = 100
+
+    layer_num = 1
+    layer_emb_sz = None
+
+    if layer_num > 1:
+        assert layer_emb_sz != None
+    bat_sz = 30
+    mini_bat_sz = 10
+    # tst_bat_sz = 2000
+    assert bat_sz % mini_bat_sz == 0
+    # assert tst_bat_sz % mini_bat_sz == 0
+
+    model_num = 1
+    model_params = {'lamb': lamb, 'lr': lr, 'emb_dim': emb_dim, 'decay_steps': decay_steps,
+                    'decay_rate': decay_rate, 'bat_sz': bat_sz, 'tst_bat_sz': bat_sz, 'exp_decay': exp_decay,
+                    'mini_bat_sz': mini_bat_sz, 'layer_num': layer_num, 'layer_emb_sz': layer_emb_sz}
+    model_path = 'model/model%d/' % model_num + construct_hp_str(model_params)
+    result_path = 'result/model%d/' % model_num + construct_hp_str(model_params)
+
+    if not os.path.exists(model_path):
+        os.makedirs(model_path)
+    if not os.path.exists(result_path):
+        os.makedirs(result_path)
+
+    train_params = dict()
+    train_params['total_ep'] = 500
+    train_params['test_ep'] = 30
+    train_params['save_ep'] = 50
+    train_params['restore_ep'] = restore_ep
+    train_params['model_path'] = model_path
+    train_params['result_path'] = result_path
+
+    run(filename=FLAGS.data_file, model_params=model_params, train_params=train_params, model=model1)
